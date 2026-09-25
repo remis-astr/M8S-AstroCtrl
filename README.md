@@ -13,7 +13,7 @@ Tous les calculs se font sur le M8S.
   Le type de monture (EQ allemande, fourche, ALT-AZ) est détecté avec `:GU#`.
 - **Plate solving ASTAP** des trames RAW de la caméra, alignement OnStepX
   sur N points (automatique ou à la raquette), sans avoir à viser d'étoile
-- **Autoguidage** façon Lacerta MGEN-3 en EQ **et** en ALT-AZ. En ALT-AZ, la
+- **Autoguidage** en EQ **et** en ALT-AZ. En ALT-AZ, la
   calibration est tournée de l'angle parallactique, et un pivot est
   réglable.
 - Raquette manuelle avec sécurité « homme mort », courbes et RMS, mode
