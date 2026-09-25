@@ -7,6 +7,33 @@ Autoguideur autonome et alignement par plate solve pour montures
 reliée en USB. L'interface est la page `guidage.html` servie par Multicam.
 Tous les calculs se font sur le M8S.
 
+## Schéma
+
+```mermaid
+flowchart TB
+    tel["📱 Téléphone / PC<br/>navigateur"]
+    subgraph cam["Multicam — RPi Zero 2 W"]
+        direction LR
+        page["page guidage.html<br/>:8000"]
+        relais["relais nftables<br/>192.168.4.1:8080"]
+        capt["caméra guide<br/>trames RAW /guide/frame"]
+    end
+    subgraph m8s["M8S Pro L — Armbian"]
+        api["m8s-ctrl — API FastAPI :8080<br/>guidage · détection d'étoiles<br/>plate solve ASTAP · alignement"]
+    end
+    monture["🔭 Monture OnStep / OnStepX<br/>FYSETC E4 ou OnStep Pro V5"]
+
+    tel -- "WiFi AllskyCam" --> page
+    tel -- "commandes" --> relais
+    relais -- "USB gadget Ethernet<br/>192.168.7.3 → 192.168.7.1" --> api
+    capt -- "trames RAW (USB)" --> api
+    api -- "USB série LX200<br/>impulsions · GoTo · sync" --> monture
+```
+
+Le téléphone ne parle qu'à Multicam, qui relaie les commandes vers le M8S.
+Le M8S lit lui-même les trames de la caméra, fait tous les calculs et pilote
+la monture.
+
 ## Fonctions
 
 - Pilotage de la monture en **LX200 série direct** (pyserial, sans INDI).
