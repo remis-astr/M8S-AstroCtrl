@@ -31,6 +31,9 @@ Tous les calculs se font sur le M8S.
 | `m8s-ctrl/guider.py`, `stars.py`, `guidecam.py` | guidage, détection d'étoiles, lecture des trames de Multicam |
 | `m8s-ctrl/m8s-ctrl.service` | service systemd |
 | `m8s-ctrl/backup-indi/` | ancienne version basée sur INDI (abandonnée) |
+| `etc/NetworkManager/…/m8s-usb-allsky.nmconnection` | IP fixe 192.168.7.1 sur la liaison USB vers Multicam |
+| `tools/e4time.py` | compare l'heure/TSL de la monture à l'heure réelle (arrêter `m8s-ctrl` avant : port série exclusif) |
+| `tools/wsraw_test.py` | test du flux RAW `/ws/raw` de Multicam (`python3 wsraw_test.py <n> <fps>`) |
 | `CONCEPTION.md` | objectifs et choix techniques |
 | `ROADMAP.md` | avancement phase par phase, détails matériels |
 
