@@ -1,0 +1,13 @@
+[Unit]
+Description=indiserver + driver LX200 OnStep (monture, port serie USB)
+After=dev-ttyUSB0.device
+Wants=dev-ttyUSB0.device
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/indiserver -v indi_lx200_OnStep
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

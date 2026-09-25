@@ -1,0 +1,14 @@
+[Unit]
+Description=API de commande M8S (monture OnStepX + plate solving ASTAP)
+After=indi-onstep.service
+Requires=indi-onstep.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/m8s-ctrl
+ExecStart=/usr/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
