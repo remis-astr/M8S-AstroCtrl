@@ -13,6 +13,17 @@ l'image avec le champ en ALT-AZ : la calibration est tournée de la rotation
 de champ *mesurée* par l'ajustement multi-étoiles depuis la calibration
 (repli sur le modèle d'angle parallactique si la mesure manque).
 
+Limite d'OnStepX en ALT-AZ (lu dans Mount.cpp / Guide.cpp, firmware
+10.28w) : la vitesse d'une impulsion n'est prise en compte que par le
+recalcul des vitesses de suivi, une fois par seconde (tâche « MtTrack »).
+Une impulsion agit donc de la première seconde « pleine » suivant son
+début jusqu'à la première suivant sa fin : un multiple d'une seconde,
+quelle que soit sa durée demandée (une impulsion de 200 ms donne 0 ou
+1000 ms d'effet, au hasard). En simulation, laisser ces impulsions libres
+(effet juste en moyenne) guide mieux que les arrondir à la seconde
+(`altaz_pulse_quantum_ms`, 0 par défaut) ; le vrai remède est le correctif
+firmware (firmware/onstepx-altaz-pulse-guide.patch).
+
 Coordonnées internes : **pixels natifs du capteur, comptés depuis son
 centre** (les modes recadrés de minicam sont centrés ; un pixel d'un mode
 binné 2×2 vaut 2 pixels natifs). Pivot, étoiles de référence et
@@ -37,10 +48,13 @@ from pathlib import Path
 import numpy as np
 
 import astro
+import journal
 import solver
 import stars as st
 
 CALIB_PATH = Path("/var/lib/m8s-ctrl/calibration.json")
+SETTINGS_PATH = Path("/var/lib/m8s-ctrl/guide_settings.json")
+SIDEREAL_ARCSEC_S = 15.041
 
 
 # ------------------------------------------------------------- interfaces --
@@ -54,9 +68,13 @@ class MountIO:
     def pulse(self, direction: str, ms: int) -> None:
         raise NotImplementedError
 
-    def state(self) -> dict:
+    def state(self, fresh: bool = False) -> dict:
         """dec_deg, ha_h, lat_deg, pier_side, mount_type (valeurs lentes)."""
         raise NotImplementedError
+
+    def guide_rate(self) -> float | None:
+        """Vitesse des impulsions en × sidéral, si la monture la donne."""
+        return None
 
 
 class AllskySource(FrameSource):
@@ -77,8 +95,14 @@ class OnStepIO(MountIO):
     def pulse(self, direction: str, ms: int) -> None:
         self.mount.pulse_guide(direction, ms)
 
-    def state(self) -> dict:
-        if self._state is None or time.monotonic() - self._t > self.cache_s:
+    def guide_rate(self) -> float | None:
+        try:
+            return self.mount.pulse_guide_rate()
+        except Exception:
+            return None
+
+    def state(self, fresh: bool = False) -> dict:
+        if fresh or self._state is None or time.monotonic() - self._t > self.cache_s:
             from onstep import parse_hours
             s = self.mount.status()
             if self._lat is None:
@@ -86,7 +110,8 @@ class OnStepIO(MountIO):
             lst = parse_hours(self.mount.cmd(":GS#"))
             self._state = {"dec_deg": s["dec_deg"], "ha_h": (lst - s["ra_h"]) % 24,
                            "lat_deg": self._lat, "pier_side": s["pier_side"],
-                           "mount_type": s["mount_type"], "tracking": s["tracking"]}
+                           "mount_type": s["mount_type"], "tracking": s["tracking"],
+                           "alt_deg": s["alt_deg"], "az_deg": s["az_deg"]}
             self._t = time.monotonic()
         return self._state
 
@@ -111,6 +136,45 @@ class Settings:
     dec_backlash_comp: bool = False      # ajoute une fraction du jeu mesuré à chaque inversion Dec
     dec_backlash_fraction: float = 0.6   # le jeu mesuré est surestimé (pas de calibration + seuil)
     arcsec_per_px: float = 1.81          # par px natif ; renseigné depuis la trame (capteur/focale)
+    # OnStepX ALT-AZ n'applique les impulsions qu'à la seconde près (voir
+    # en tête) : arrondi des impulsions à ce multiple ; 0 = impulsions libres.
+    altaz_pulse_quantum_ms: int = 0
+    calib_drift_frames: int = 6          # trames sans impulsion pour mesurer la dérive
+    calib_max_ortho_deg: float = 20.0    # au-delà, calibration refusée (l'ancienne est gardée)
+
+
+def load_settings(path: Path = SETTINGS_PATH) -> Settings:
+    """Réglages enregistrés ; les clés inconnues (anciennes versions) sont
+    ignorées, les absentes gardent leur valeur par défaut."""
+    s = Settings()
+    try:
+        saved = json.loads(path.read_text())
+    except Exception:
+        return s
+    for k, v in saved.items():
+        if hasattr(s, k):
+            setattr(s, k, coerce(getattr(s, k), v))
+    return s
+
+
+def save_settings(s: Settings, path: Path = SETTINGS_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(asdict(s), indent=1))
+    tmp.replace(path)
+
+
+def coerce(current, value):
+    """Convertit `value` au type du réglage existant (JSON de la page)."""
+    if isinstance(current, bool):
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "on", "oui", "yes")
+        return bool(value)
+    if isinstance(current, int):
+        return int(round(float(value)))
+    if isinstance(current, float):
+        return float(value)
+    return str(value)
 
 
 @dataclass
@@ -131,6 +195,10 @@ class Calibration:
     rot_end_deg: float = 0.0
     ortho_error_deg: float = 0.0
     backlash_ms: int = 0
+    drift_px_s: list[float] = field(default_factory=lambda: [0.0, 0.0])   # soustraite des mesures
+    guide_rate_x: float | None = None     # vitesse des impulsions lue sur la monture
+    ra_speed_ratio: float | None = None   # vitesse mesurée / attendue (1,0 = conforme)
+    dec_speed_ratio: float | None = None
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -153,8 +221,10 @@ def rot(v: np.ndarray, deg: float) -> np.ndarray:
 
 class Guider:
     def __init__(self, source: FrameSource, mount: MountIO, settings: Settings | None = None,
-                 calib_path: Path = CALIB_PATH) -> None:
+                 calib_path: Path = CALIB_PATH, log_events: bool = True) -> None:
         self.src, self.mount = source, mount
+        self.log_events = log_events
+        self.dry_run = False            # guidage « à blanc » : mesure sans impulsion
         self.settings = settings or Settings()
         self.calib_path = calib_path
         self.calibration = Calibration.load(calib_path)
@@ -177,6 +247,20 @@ class Guider:
     def busy(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    def _event(self, kind: str, **data) -> None:
+        if self.log_events:
+            journal.event(kind, **data)
+
+    def _quantum(self, mstate: dict) -> int:
+        if mstate.get("mount_type") in ("ALTAZM", "ALTALT"):
+            return max(0, int(self.settings.altaz_pulse_quantum_ms))
+        return 0
+
+    @staticmethod
+    def _quantize(ms: float, q: int) -> float:
+        """Arrondi au multiple de `q` le plus proche (q = 0 : inchangé)."""
+        return float(round(ms / q) * q) if q else ms
+
     def _grab(self, skip: int = 0):
         for _ in range(skip):
             self.src.fetch()
@@ -190,6 +274,7 @@ class Guider:
             self.settings.arcsec_per_px = round(206.265 * base / solver.GUIDE_FOCAL_MM, 3)
         native = [st.Star((x.x - cx) * k, (x.y - cy) * k, x.flux, x.snr, x.peak, x.saturated) for x in found]
         self.last_frame, self.last_stars = f, native
+        self.last_grab_t = time.monotonic()
         return f, native
 
     def _pivot(self, shape=None) -> np.ndarray:
@@ -261,8 +346,11 @@ class Guider:
         self._start(self._calibrate)
 
     def _step_until(self, direction: str, ref, origin_t, target_px: float, max_steps: int,
-                    record: bool, prev=None):
-        """Impulsions répétées ; renvoie ([(ms cumulées, déplacement px)], dernière similitude)."""
+                    record: bool, prev=None, drift=None, t_origin: float = 0.0):
+        """Impulsions répétées ; renvoie ([(ms cumulées, déplacement px, instant)],
+        dernière similitude). Avec `record`, le déplacement est ramené dans le
+        repère de la référence et corrigé de la dérive `drift` (px/s dans ce
+        repère) accumulée depuis `t_origin`."""
         s = self.settings
         pts, cum, t_pred = [], 0, origin_t.copy()
         for _ in range(max_steps):
@@ -280,10 +368,17 @@ class Guider:
             t_pred, prev = fit.t, fit
             # déplacement exprimé dans le repère de la référence (dérotation
             # de la rotation de champ accumulée : ALT-AZ)
+            now = self.last_grab_t
             rel = rot(d - origin_t, -math.degrees(fit.angle)) if record else d
-            pts.append((cum, rel))
+            if record and drift is not None:
+                rel = rel - drift * (now - t_origin)
+            pts.append((cum, rel, now))
             if record:
-                self.calib_log.append({"dir": direction, "ms": cum, "dx": float(d[0]), "dy": float(d[1])})
+                entry = {"dir": direction, "ms": cum, "dx": float(d[0]), "dy": float(d[1]),
+                         "rel_x": round(float(rel[0]), 3), "rel_y": round(float(rel[1]), 3),
+                         "t": round(now - t_origin, 2), "stars": fit.n}
+                self.calib_log.append(entry)
+                self._event("calib_point", **entry)
             if np.hypot(*(d - origin_t)) >= target_px:
                 break
         return pts, prev
@@ -301,30 +396,79 @@ class Guider:
         d = np.array([p[1] for p in pts])
         return (ms[:, None] * d).sum(axis=0) / (ms ** 2).sum()
 
-    def _return(self, direction: str, total_ms: int) -> None:
+    def _return(self, direction: str, total_ms: int, q: int = 0) -> None:
         left = total_ms
+        chunk = self.settings.max_pulse_ms
+        if q:
+            left = max(q, int(self._quantize(total_ms, q)))
+            chunk = max(q, chunk // q * q)
         while left > 0 and not self._stop:
-            step = min(left, self.settings.max_pulse_ms)
+            step = min(left, chunk)
             self.mount.pulse(direction, step)
-            time.sleep(step / 1000 + 0.1)
+            time.sleep(step / 1000 + 0.1 + q / 1000)
             left -= step
+
+    def _measure_drift(self, ref, n: int, t_ref: float):
+        """Dérive du pivot sans impulsion (px/s, repère de la référence) sur
+        `n` trames, et dernière similitude pour enchaîner les prédictions."""
+        pts, prev = [(0.0, np.zeros(2))], None
+        for _ in range(n):
+            if self._stop:
+                raise RuntimeError("calibration interrompue")
+            f, found = self._grab()
+            fit = self._measure(ref, found, np.zeros(2) if prev is None else prev.t, prev=prev)
+            if fit is None:
+                raise RuntimeError("étoiles perdues pendant la mesure de dérive")
+            piv = self._pivot(f.data.shape)
+            d = fit.apply(piv[None])[0] - piv
+            pts.append((self.last_grab_t - t_ref, rot(d, -math.degrees(fit.angle))))
+            prev = fit
+        t = np.array([p[0] for p in pts])
+        dd = np.array([p[1] for p in pts])
+        if n < 2 or np.ptp(t) < 0.5:
+            return np.zeros(2), prev
+        tc = t - t.mean()
+        v = (tc[:, None] * (dd - dd.mean(axis=0))).sum(axis=0) / (tc ** 2).sum()
+        return v, prev
 
     def _calibrate(self) -> None:
         s = self.settings
-        self.state, self.message, self.calib_log = "calibrating", "calibration RA", []
-        mstate = self.mount.state()
+        self.state, self.message, self.calib_log = "calibrating", "calibration : mesure de la dérive", []
+        mstate = self.mount.state(fresh=True)
         if mstate.get("tracking") is False:
             raise RuntimeError("le suivi doit être actif (OnStepX n'applique les impulsions qu'en suivi)")
+        q = self._quantum(mstate)
+        step_ms = s.calib_step_ms if not q else max(q, int(self._quantize(s.calib_step_ms, q)))
+        s_step = s.calib_step_ms
+        s.calib_step_ms = step_ms
+        try:
+            self._calibrate_run(mstate, q)
+        finally:
+            s.calib_step_ms = s_step
+
+    def _calibrate_run(self, mstate: dict, q: int) -> None:
+        s = self.settings
         f, found = self._grab()
         if len(found) < 1:
             raise RuntimeError("aucune étoile détectée")
+        t_ref = self.last_grab_t
         ref = np.array([[x.x, x.y] for x in found])
         zero = np.zeros(2)
+        self._event("calib_start", settings=asdict(s), mount=mstate, stars=len(found),
+                    exposure_ms=f.exposure_us / 1000, quantum_ms=q)
+        # Dérive propre du suivi (sans impulsion) : sinon elle s'ajoute aux
+        # vecteurs mesurés — une dérive forte donne deux vecteurs quasi
+        # parallèles (calibration du 25/09 : orthogonalité 88,6°).
+        drift, prev = self._measure_drift(ref, s.calib_drift_frames, t_ref)
+        self._event("calib_drift", drift_px_s=drift.tolist(),
+                    drift_arcsec_s=round(float(np.hypot(*drift)) * s.arcsec_per_px, 3))
         # RA
-        pts_ra, last = self._step_until("w", ref, zero, s.calib_target_px, s.calib_max_steps, True)
+        self.message = "calibration RA"
+        pts_ra, last = self._step_until("w", ref, zero, s.calib_target_px, s.calib_max_steps, True,
+                                        prev=prev, drift=drift, t_origin=t_ref)
         v_ra = self._slope(pts_ra)
         self.message = "retour RA"
-        self._return("e", pts_ra[-1][0])
+        self._return("e", pts_ra[-1][0], q)
         # Dec : rattrapage du jeu (on pousse vers le nord jusqu'à un vrai mouvement)
         self.message = "rattrapage du jeu Dec"
         f, found = self._grab(skip=s.skip_frames_after_pulse)
@@ -338,12 +482,13 @@ class Guider:
         base = fit0.apply(piv[None])[0] - piv
         pts_bl, fit_bl = self._step_until("n", ref, base, 3.0, 15, False, prev=fit0)
         backlash_ms = pts_bl[-1][0]
-        origin = pts_bl[-1][1]
+        origin, t_bl = pts_bl[-1][1], pts_bl[-1][2]
         self.message = "calibration Dec"
-        pts_dec, fit_dec = self._step_until("n", ref, origin, s.calib_target_px, s.calib_max_steps, True, prev=fit_bl)
+        pts_dec, fit_dec = self._step_until("n", ref, origin, s.calib_target_px, s.calib_max_steps, True,
+                                            prev=fit_bl, drift=drift, t_origin=t_bl)
         v_dec = self._slope(pts_dec)
         self.message = "retour Dec"
-        self._return("s", pts_dec[-1][0] + backlash_ms)
+        self._return("s", pts_dec[-1][0] + backlash_ms, q)
         if np.hypot(*v_ra) == 0 or np.hypot(*v_dec) == 0:
             raise RuntimeError("aucun mouvement mesuré pendant la calibration")
         ang = math.degrees(math.atan2(v_dec[1], v_dec[0]) - math.atan2(v_ra[1], v_ra[0]))
@@ -353,26 +498,47 @@ class Guider:
         f, found = self._grab(skip=s.skip_frames_after_pulse)
         fit_end = self._measure(ref, found, zero, prev=self._rotation_only(fit_dec, self._pivot(f.data.shape)))
         rot_end = math.degrees((fit_end or fit_dec).angle)
-        mstate = self.mount.state()
-        self.calibration = Calibration(
+        mstate = self.mount.state(fresh=True)
+        # Vitesses attendues d'après la vitesse d'impulsion de la monture
+        rate = self.mount.guide_rate()
+        ra_ratio = dec_ratio = None
+        if rate:
+            exp_dec = rate * SIDEREAL_ARCSEC_S / s.arcsec_per_px / 1000          # px/ms
+            exp_ra = exp_dec * max(math.cos(math.radians(mstate["dec_deg"])), 0.05)
+            ra_ratio = round(float(np.hypot(*v_ra)) / exp_ra, 3)
+            dec_ratio = round(float(np.hypot(*v_dec)) / exp_dec, 3)
+        cal = Calibration(
             v_ra=[float(v_ra[0]), float(v_ra[1])], v_dec=[float(v_dec[0]), float(v_dec[1])],
             dec_deg=mstate["dec_deg"], ha_h=mstate["ha_h"], lat_deg=mstate["lat_deg"],
             pier_side=mstate["pier_side"], mount_type=mstate["mount_type"],
             q_deg=astro.parallactic_angle_deg(mstate["ha_h"], mstate["dec_deg"], mstate["lat_deg"]),
             time=time.time(), ref_stars=[[x.x, x.y] for x in found],
             rot_end_deg=round(rot_end, 4), ortho_error_deg=round(ortho, 1),
-            backlash_ms=int(backlash_ms))
-        self.calibration.save(self.calib_path)
-        self.message = (f"calibration OK — RA {np.hypot(*v_ra) * 1000:.2f} px/s, "
-                        f"Dec {np.hypot(*v_dec) * 1000:.2f} px/s, orthogonalité {ortho:.1f}°"
-                        + (" (> 10° : à vérifier)" if ortho > 10 else ""))
+            backlash_ms=int(backlash_ms), drift_px_s=[float(drift[0]), float(drift[1])],
+            guide_rate_x=rate, ra_speed_ratio=ra_ratio, dec_speed_ratio=dec_ratio)
+        summary = (f"RA {np.hypot(*v_ra) * 1000:.2f} px/s"
+                   + (f" ({ra_ratio:.2f}× l'attendu)" if ra_ratio else "")
+                   + f", Dec {np.hypot(*v_dec) * 1000:.2f} px/s"
+                   + (f" ({dec_ratio:.2f}× l'attendu)" if dec_ratio else "")
+                   + f", orthogonalité {ortho:.1f}°, jeu Dec {backlash_ms} ms"
+                   + f", dérive {np.hypot(*drift) * s.arcsec_per_px:.2f}″/s")
+        if ortho > s.calib_max_ortho_deg:
+            self._event("calib_rejected", calibration=asdict(cal), reason=f"orthogonalité {ortho:.1f}°")
+            raise RuntimeError(f"calibration refusée ({summary}) — ancienne calibration conservée")
+        self.calibration = cal
+        cal.save(self.calib_path)
+        self._event("calib_result", calibration=asdict(cal))
+        self.message = "calibration OK — " + summary
         self.state = "idle"
 
     # -- guidage -----------------------------------------------------------
 
-    def start_guiding(self) -> None:
+    def start_guiding(self, dry_run: bool = False) -> None:
         if self.calibration is None:
             raise RuntimeError("pas de calibration")
+        if self.busy:
+            raise RuntimeError(f"guideur occupé ({self.state})")
+        self.dry_run = dry_run
         self._start(self._guide)
 
     def _q_since_calibration(self, mstate) -> float:
@@ -398,8 +564,9 @@ class Guider:
         self.state, self.message = "guiding", "acquisition"
         self.history.clear()
         self.last_fit = None
-        mstate = self.mount.state()
+        mstate = self.mount.state(fresh=True)
         altaz = mstate["mount_type"] in ("ALTAZM", "ALTALT")
+        q = self._quantum(mstate)
         f, found = self._grab()
         if not found:
             raise RuntimeError("aucune étoile détectée")
@@ -416,6 +583,16 @@ class Guider:
             else:
                 rot0, rot0_src = self.rotation_parity * self._q_since_calibration(mstate), "modèle"
         t_pred, prev_ra_ms, lost, t0 = np.zeros(2), 0.0, 0, time.time()
+        self._event("guide_start", dry_run=self.dry_run, quantum_ms=q, settings=asdict(s),
+                    calibration=asdict(self.calibration) | {"ref_stars": len(self.calibration.ref_stars)},
+                    mount=mstate, rot0_deg=round(rot0, 3), rot0_src=rot0_src)
+        try:
+            self._guide_loop(s, q, altaz, ref, pivot, rot0, rot0_src, t_pred, prev_ra_ms, lost, t0)
+        finally:
+            self._event("guide_stop", state=self.state, message=self.message, rms=self.rms(10 ** 6))
+
+    def _guide_loop(self, s, q, altaz, ref, pivot, rot0, rot0_src, t_pred, prev_ra_ms, lost, t0) -> None:
+        mstate = self.mount.state()
         last_dec_sign = 0
         q_start = self._q_since_calibration(mstate) if altaz else 0.0
         skip = 0
@@ -428,6 +605,7 @@ class Guider:
             if fit is None:
                 lost += 1
                 self.state, self.message = "lost", f"étoiles perdues ({lost})"
+                self._event("guide_lost", n=lost, stars=len(found))
                 skip = 0
                 continue
             self.state, lost = "guiding", 0
@@ -457,6 +635,14 @@ class Guider:
             prev_ra_ms = ra_cmd
             ra_cmd = float(np.clip(ra_cmd, -s.max_pulse_ms, s.max_pulse_ms))
             dec_cmd = float(np.clip(dec_cmd, -s.max_pulse_ms, s.max_pulse_ms))
+            if q:
+                # l'effet réel est un multiple de q (ALT-AZ) : on demande ce
+                # qui sera appliqué, et le filtre RA mémorise la même valeur
+                ra_cmd = self._quantize(ra_cmd, q)
+                dec_cmd = self._quantize(dec_cmd, q)
+                prev_ra_ms = ra_cmd
+            if self.dry_run:
+                ra_cmd = dec_cmd = 0.0
             if abs(ra_cmd) >= 1:
                 self.mount.pulse("w" if ra_cmd > 0 else "e", int(abs(ra_cmd)))
             if abs(dec_cmd) >= 1:
@@ -466,10 +652,13 @@ class Guider:
                     extra = int(self.calibration.backlash_ms * s.dec_backlash_fraction)
                 last_dec_sign = sign
                 dec_cmd = sign * min(abs(dec_cmd) + extra, s.max_pulse_ms + extra)
-                self.mount.pulse("n" if sign > 0 else "s", int(abs(dec_cmd)))
+                if q:
+                    dec_cmd = self._quantize(dec_cmd, q)
+                if abs(dec_cmd) >= 1:
+                    self.mount.pulse("n" if sign > 0 else "s", int(abs(dec_cmd)))
             longest = max(abs(ra_cmd), abs(dec_cmd))
             best_snr = max((x.snr for x in found), default=0.0)
-            self.history.append({
+            entry = {
                 "t": round(time.time() - t0, 2),
                 "dx": round(float(d[0]), 3), "dy": round(float(d[1]), 3),
                 "ra_arcsec": round(float(ra_px) * s.arcsec_per_px, 2),
@@ -477,10 +666,16 @@ class Guider:
                 "ra_pulse_ms": int(ra_cmd), "dec_pulse_ms": int(dec_cmd),
                 "stars": fit.n, "snr": round(best_snr, 1),
                 "rot_deg": round(rot_total, 3), "rot_model_deg": round(model_rot, 3),
-            })
+            }
+            self.history.append(entry)
+            self._event("guide_frame", **entry, ra_want_ms=round(float(ra_ms), 1),
+                        dec_want_ms=round(float(dec_ms), 1), fit_rms=round(float(fit.rms), 3),
+                        exp_ms=self.last_frame.exposure_us / 1000, dry=self.dry_run,
+                        alt=mstate.get("alt_deg"), az=mstate.get("az_deg"))
             self.message = f"guidage — {fit.n} étoile(s), rotation {rot_total:+.2f}° ({rot0_src} au départ)"
             if longest >= 1:
-                time.sleep(longest / 1000)
+                # en ALT-AZ l'effet dure jusqu'au recalcul suivant (≤ q)
+                time.sleep((longest + q) / 1000)
                 skip = s.skip_frames_after_pulse
             else:
                 skip = 0
@@ -503,7 +698,7 @@ class Guider:
             "state": self.state, "message": self.message,
             "calibration": asdict(self.calibration) | {"ref_stars": len(self.calibration.ref_stars)}
             if self.calibration else None,
-            "settings": asdict(self.settings), "rms": self.rms(),
+            "settings": asdict(self.settings), "rms": self.rms(), "dry_run": self.dry_run,
             "frame": {"sensor": f.sensor, "raw_mode": f.raw_mode, "exposure_ms": f.exposure_us / 1000,
                       "gain": f.gain, "stars": len(self.last_stars),
                       # pour convertir un clic sur la vignette en px natifs (pivot)
@@ -525,7 +720,8 @@ class SimSky(FrameSource, MountIO):
     def __init__(self, shape=(1080, 2028), n_stars=25, seed=3, mount_type="ALTAZM",
                  ra_angle_deg=35.0, rate_px_s=2.1, dec_backlash_ms=1500,
                  drift_px_s=(0.05, -0.03), pe_amp_px=2.0, pe_period_s=120.0,
-                 seeing_px=0.15, field_rot_deg_s=0.0, exposure_s=0.5, dec_deg=40.0) -> None:
+                 seeing_px=0.15, field_rot_deg_s=0.0, exposure_s=0.5, dec_deg=40.0,
+                 tick_s: float | None = None) -> None:
         self.rng = np.random.default_rng(seed)
         self.h, self.w = shape
         self.x = self.rng.uniform(30, self.w - 30, n_stars)
@@ -542,6 +738,8 @@ class SimSky(FrameSource, MountIO):
         self.drift, self.pe_amp, self.pe_period = np.array(drift_px_s), pe_amp_px, pe_period_s
         self.seeing, self.rot_rate, self.exposure_s = seeing_px, field_rot_deg_s, exposure_s
         self.crop: tuple[int, int] | None = None   # (w, h) : simule un mode vidéo recadré
+        # OnStepX ALT-AZ : impulsions prises en compte par un recalcul à 1 Hz
+        self.tick_s = (1.0 if mount_type in ("ALTAZM", "ALTALT") else 0.0) if tick_s is None else tick_s
         self.lock = threading.Lock()
 
     def _angle(self) -> float:
@@ -549,6 +747,11 @@ class SimSky(FrameSource, MountIO):
 
     def pulse(self, direction: str, ms: int) -> None:
         with self.lock:
+            if self.tick_s:
+                # effet = nombre de recalculs pendant l'impulsion × période
+                now = time.monotonic() - self.t0 + self.rng.uniform(0, self.tick_s)
+                T = self.tick_s
+                ms = (math.floor((now + ms / 1000) / T) - math.floor(now / T)) * T * 1000
             ang = math.degrees(self._angle())
             if direction in "we":
                 v = rot(self.v_ra0, ang)
@@ -561,9 +764,9 @@ class SimSky(FrameSource, MountIO):
                 self.dec_slack = max(0.0, self.dec_slack - ms)
                 self.offset += rot(self.v_dec0, ang) * eff * sign
 
-    def state(self) -> dict:
+    def state(self, fresh: bool = False) -> dict:
         return {"dec_deg": self.dec_deg, "ha_h": 1.0, "lat_deg": 47.3, "pier_side": None,
-                "mount_type": self.mount_type, "tracking": True}
+                "mount_type": self.mount_type, "tracking": True, "alt_deg": 50.0, "az_deg": 200.0}
 
     def true_pivot_offset(self, pivot) -> np.ndarray:
         """Déplacement réel (px) du pivot depuis le début : vérité terrain."""

@@ -21,35 +21,49 @@ from pydantic import BaseModel, Field
 
 import astro
 import guider as gd
+import journal
 import solver
+import urllib.request
 from align import AlignJob
+from axismeas import StepsJob
 from onstep import OnStep, OnStepError, parse_degrees
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("m8s-ctrl")
 
 STATE_PATH = Path("/var/lib/m8s-ctrl/state.json")
-# La monture est la référence de temps (décision utilisateur du 24/09) :
-# le NTP du M8S est désactivé et l'horloge système est recalée sur la E4.
+# Référence de temps = allsky (29/09) : sa page règle son horloge sur celle
+# du téléphone à chaque connexion. Le NTP du M8S est désactivé (pas
+# d'Internet au jardin) et son horloge est recalée sur celle d'allsky.
+# La E4 n'est jamais écrite : son écart est seulement contrôlé
+# (/mount/site), l'utilisateur la met à l'heure via SWS.
+ALLSKY_TIME_URL = "http://192.168.7.3:8000/system/time"
 CLOCK_TOLERANCE_S = 0.5
 CLOCK_RESYNC_PERIOD_S = 900
+MOUNT_CLOCK_TOLERANCE_S = 5.0
 
 mount = OnStep()
 align_job = AlignJob(mount)
-real_guider = gd.Guider(gd.AllskySource(), gd.OnStepIO(mount))
+steps_job = StepsJob(mount)
+real_guider = gd.Guider(gd.AllskySource(), gd.OnStepIO(mount), settings=gd.load_settings())
 guider = real_guider           # remplacé par un guideur simulé en mode simulation
 clock_state: dict = {}
 
 
-def sync_clock_from_mount() -> dict:
-    """Recale l'horloge système du M8S sur l'UTC de la monture."""
-    utc, read_at = mount.utc_time()
-    delta = (utc - read_at).total_seconds()
+def sync_clock_from_allsky() -> dict:
+    """Recale l'horloge système du M8S sur celle d'allsky (aller-retour
+    HTTP compensé de moitié)."""
+    t0 = time.time()
+    with urllib.request.urlopen(ALLSKY_TIME_URL, timeout=5) as r:
+        remote = json.loads(r.read())["epoch_ms"] / 1000
+    t1 = time.time()
+    delta = remote - (t0 + t1) / 2
     applied = abs(delta) > CLOCK_TOLERANCE_S
     if applied:
         time.clock_settime(time.CLOCK_REALTIME, time.time() + delta)
-        log.info("horloge système recalée sur la monture: %+.2f s", delta)
-    clock_state.update(last_sync=time.time(), delta_s=round(delta, 3), applied=applied)
+        log.info("horloge système recalée sur allsky: %+.2f s", delta)
+    clock_state.update(source="allsky", last_sync=time.time(), delta_s=round(delta, 3),
+                       applied=applied, rtt_s=round(t1 - t0, 3))
     return dict(clock_state)
 
 
@@ -57,9 +71,9 @@ def clock_loop() -> None:
     while True:
         time.sleep(CLOCK_RESYNC_PERIOD_S)
         try:
-            sync_clock_from_mount()
-        except OnStepError as e:
-            log.warning("recalage horaire impossible: %s", e)
+            sync_clock_from_allsky()
+        except Exception as e:
+            log.warning("recalage horaire sur allsky impossible: %s", e)
 
 
 app = FastAPI(title="m8s-ctrl")
@@ -72,10 +86,13 @@ def startup() -> None:
     # Connexion dès le démarrage pour que l'éventuel reset de l'ESP32 à
     # l'ouverture du port ait lieu maintenant, pas pendant une commande.
     try:
+        sync_clock_from_allsky()
+    except Exception as e:
+        log.warning("heure d'allsky illisible au démarrage: %s", e)
+    try:
         mount.connect()
-        sync_clock_from_mount()
     except OnStepError as e:
-        log.warning("monture non connectée ou heure illisible au démarrage: %s", e)
+        log.warning("monture non connectée au démarrage: %s", e)
     threading.Thread(target=clock_loop, daemon=True).start()
 
 
@@ -140,9 +157,13 @@ def mount_site():
     lst_mount = mount_call(mount.sidereal_hours)
     lon_east = -parse_degrees(info["longitude"])   # LX200 : est négatif
     lst_calc = local_sidereal_hours(utc, lon_east)
+    mount_error = round((utc - read_at).total_seconds(), 3)
     info.update(
         utc=utc.isoformat(timespec="milliseconds"),
-        system_minus_mount_s=round((read_at - utc).total_seconds(), 3),
+        system_minus_mount_s=-mount_error,
+        # horloge de la E4 comparée à celle du M8S (= allsky = téléphone)
+        mount_clock_error_s=mount_error,
+        mount_clock_ok=abs(mount_error) <= MOUNT_CLOCK_TOLERANCE_S,
         sidereal_mount_h=round(lst_mount, 6),
         sidereal_error_s=round(((lst_mount - lst_calc + 12) % 24 - 12) * 3600, 2),
         clock=dict(clock_state),
@@ -152,7 +173,32 @@ def mount_site():
 
 @app.post("/time/sync")
 def time_sync():
-    return mount_call(sync_clock_from_mount)
+    try:
+        return sync_clock_from_allsky()
+    except Exception as e:
+        raise HTTPException(502, f"heure d'allsky illisible: {e}") from e
+
+
+@app.get("/time/check")
+def time_check():
+    """Contrôle en lecture seule contre un serveur NTP (si le M8S a accès
+    à Internet, ex. par le CPL) : écart de l'horloge du M8S et de la E4.
+    Ne règle rien."""
+    import re
+    import subprocess
+    out = subprocess.run(["chronyd", "-Q", "-t", "8", "server pool.ntp.org iburst"],
+                         capture_output=True, text=True, timeout=15)
+    m = re.search(r"System clock wrong by (-?[\d.]+) seconds", out.stdout + out.stderr)
+    if not m:
+        raise HTTPException(502, f"NTP injoignable: {(out.stdout + out.stderr)[-200:]}")
+    ntp_minus_system = float(m[1])
+    res = {"system_error_s": round(-ntp_minus_system, 3)}
+    try:
+        utc, read_at = mount.utc_time()
+        res["mount_error_s"] = round((utc - read_at).total_seconds() - ntp_minus_system, 3)
+    except OnStepError as e:
+        res["mount_error"] = str(e)
+    return res
 
 
 class TrackBody(BaseModel):
@@ -215,6 +261,7 @@ def _do_solve(blind: bool) -> solver.SolveResult:
         st = mount_call(mount.status)
         hint = (st["ra_h"], st["dec_deg"])
     res = solver.solve(hint=hint)
+    journal.event("solve", **res.as_dict())
     state = read_state()
     state["last_solve"] = {"ts": time.time(), **res.as_dict()}
     write_state(state)
@@ -332,17 +379,21 @@ def _guider_call(fn, *args):
 
 @app.post("/guide/calibrate")
 def guide_calibrate():
-    if align_job.active:
-        raise HTTPException(409, "alignement en cours")
+    if align_job.active or steps_job.running:
+        raise HTTPException(409, "alignement ou mesure des axes en cours")
     _guider_call(guider.start_calibration)
     return {"ok": True}
 
 
+class GuideStartBody(BaseModel):
+    dry_run: bool = False     # mesure l'erreur sans envoyer d'impulsion (dérive du suivi)
+
+
 @app.post("/guide/start")
-def guide_start():
-    if align_job.active:
-        raise HTTPException(409, "alignement en cours")
-    _guider_call(guider.start_guiding)
+def guide_start(body: GuideStartBody | None = None):
+    if align_job.active or steps_job.running:
+        raise HTTPException(409, "alignement ou mesure des axes en cours")
+    _guider_call(guider.start_guiding, bool(body and body.dry_run))
     return {"ok": True}
 
 
@@ -371,8 +422,14 @@ def guide_settings_set(changes: dict):
     bad = [k for k in changes if k not in known]
     if bad:
         raise HTTPException(400, f"réglages inconnus: {bad}")
-    for k, v in changes.items():
-        setattr(guider.settings, k, v)
+    try:
+        for k, v in changes.items():
+            setattr(guider.settings, k, gd.coerce(known[k], v))
+    except (TypeError, ValueError) as e:
+        raise HTTPException(400, f"valeur invalide: {e}") from e
+    if guider is real_guider:
+        gd.save_settings(guider.settings)      # persistants (redémarrage du service)
+        journal.event("guide_settings", changes=changes)
     return gd.asdict(guider.settings)
 
 
@@ -401,7 +458,8 @@ def guide_simulation(body: SimBody):
         raise HTTPException(409, "guideur occupé : l'arrêter d'abord")
     if body.enabled:
         sky = gd.SimSky(mount_type=body.mount_type, field_rot_deg_s=body.field_rot_deg_s)
-        guider = gd.Guider(sky, sky, calib_path=Path("/var/lib/m8s-ctrl/calibration_sim.json"))
+        guider = gd.Guider(sky, sky, calib_path=Path("/var/lib/m8s-ctrl/calibration_sim.json"),
+                           log_events=False)
     else:
         guider = real_guider
     return {"ok": True, "simulated": guider is not real_guider}
@@ -480,8 +538,8 @@ class PaddleBody(BaseModel):
 
 @app.post("/paddle/press")
 def paddle_press(body: PaddleBody):
-    if guider.busy or align_job.running:
-        raise HTTPException(409, "raquette indisponible pendant le guidage, la calibration ou l'alignement")
+    if guider.busy or align_job.running or steps_job.running:
+        raise HTTPException(409, "raquette indisponible pendant le guidage, la calibration, l'alignement ou la mesure des axes")
     mount_call(paddle.press, body.direction, body.rate)
     return {"ok": True, "active": list(paddle.active)}
 
@@ -515,3 +573,41 @@ def optics_set(body: OpticsBody):
     passage en ″ en dépend."""
     solver.save_optics(body.focal_mm)
     return {"focal_mm": solver.GUIDE_FOCAL_MM}
+
+
+# ------------------------------------------------- réglages des axes ----
+
+@app.get("/mount/axes")
+def mount_axes():
+    """Réglages des axes lus dans la E4 (lecture seule) : pas par degré en
+    service et en NV, micro-pas, courants, jeu, vitesse des impulsions."""
+    return mount_call(mount.axis_setup)
+
+
+class StepsBody(BaseModel):
+    axis: int = Field(ge=1, le=2)             # 1 = azimut (AD), 2 = hauteur (Déc)
+    points: int = Field(5, ge=3, le=12)
+    move_s: float = Field(8.0, gt=0.5, le=60)  # durée de chaque déplacement
+    rate: int = Field(9, ge=5, le=9)          # vitesse de raquette (9 = max)
+    direction: str | None = None              # w/e (axe 1), n/s (axe 2) ; défaut w / n
+
+
+@app.post("/mount/steps/start")
+def steps_start(body: StepsBody):
+    """Mesure des pas/degré d'un axe par plate solve (voir axismeas.py).
+    Arrête le suivi ; aucun réglage n'est écrit dans la E4."""
+    if guider.busy or align_job.active:
+        raise HTTPException(409, "guideur ou alignement en cours")
+    mount_call(steps_job.start, body.axis, body.points, body.move_s, body.rate, body.direction)
+    return {"ok": True}
+
+
+@app.get("/mount/steps/status")
+def steps_status():
+    return steps_job.state
+
+
+@app.post("/mount/steps/abort")
+def steps_abort():
+    steps_job.abort()
+    return {"ok": True}

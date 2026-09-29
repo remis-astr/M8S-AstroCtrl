@@ -1,0 +1,96 @@
+diff --git a/src/telescope/mount/Mount.cpp b/src/telescope/mount/Mount.cpp
+index 4d9e42d..37d5c54 100644
+--- a/src/telescope/mount/Mount.cpp
++++ b/src/telescope/mount/Mount.cpp
+@@ -438,6 +438,21 @@ void Mount::poll() {
+     if (axis1.isEnabled() || axis2.isEnabled()) enable(false);
+   }
+ 
++  // keep track of where we are pointing
++  #if MOUNT_COORDS_MEMORY == ON
++    saveCoordinateMemory(startupAuthority.trusted() && home.state != HS_HOMING);
++  #endif
++
++  updateTrackingRates();
++}
++
++// on ALTAZM/ALTALT mounts pulse guide rates only act through the tracking rate
++// calculation, recalculate now instead of waiting for the next poll() (up to 1s)
++void Mount::pulseGuideChanged() {
++  if (transform.mountType == ALTAZM || transform.mountType == ALTALT) updateTrackingRates(); else update();
++}
++
++void Mount::updateTrackingRates() {
+   #ifdef HAL_NO_DOUBLE_PRECISION
+     #define DiffRange  0.0087266463F         // 30 arc-minutes in radians
+     #define DiffRange2 0.017453292F          // 60 arc-minutes in radians
+@@ -447,11 +462,6 @@ void Mount::poll() {
+   #endif
+   #define DegenerateRange (DiffRange*1.5)    // we were using Deg85
+ 
+-  // keep track of where we are pointing
+-  #if MOUNT_COORDS_MEMORY == ON
+-    saveCoordinateMemory(startupAuthority.trusted() && home.state != HS_HOMING);
+-  #endif
+-
+   if (trackingState == TS_NONE) {
+     trackingRateAxis1 = 0.0F;
+     trackingRateAxis2 = 0.0F;
+diff --git a/src/telescope/mount/Mount.h b/src/telescope/mount/Mount.h
+index 6041b2d..57db136 100644
+--- a/src/telescope/mount/Mount.h
++++ b/src/telescope/mount/Mount.h
+@@ -110,6 +110,13 @@ class Mount {
+     // called once a second by poll() but available here for immediate action
+     void update();
+ 
++    // recalculates the tracking rates now; on ALTAZM/ALTALT mounts this is where
++    // pulse guide rates are applied, so it is called at the start and end of each pulse
++    void updateTrackingRates();
++
++    // called by Guide when a pulse guide starts or stops
++    void pulseGuideChanged();
++
+     void poll();
+ 
+     // all in sidereal units 1x = 15 arc-seconds/sidereal second
+diff --git a/src/telescope/mount/guide/Guide.cpp b/src/telescope/mount/guide/Guide.cpp
+index 41c0e7f..633b1a4 100644
+--- a/src/telescope/mount/guide/Guide.cpp
++++ b/src/telescope/mount/guide/Guide.cpp
+@@ -68,7 +68,7 @@ CommandError Guide::startAxis1(GuideAction guideAction, GuideRateSelect rateSele
+     state = GU_PULSE_GUIDE;
+     if (guideAction == GA_REVERSE) { VF("MSG: Guide, Axis1 rev @"); rateAxis1 = -rate; } else { VF("MSG: Guide, Axis1 fwd @"); rateAxis1 = rate; }
+     V(rate); VL("X");
+-    mount.update();
++    mount.pulseGuideChanged();
+   } else {
+     state = GU_GUIDE;
+     backlashEnableControl(true);
+@@ -96,7 +96,7 @@ void Guide::stopAxis1(GuideAction stopDirection, bool abort) {
+       VLF("MSG: Guide, Axis1 stopped");
+       guideActionAxis1 = GA_NONE;
+       rateAxis1 = 0.0F;
+-      mount.update();
++      mount.pulseGuideChanged();
+     }
+   }
+ }
+@@ -129,7 +129,7 @@ CommandError Guide::startAxis2(GuideAction guideAction, GuideRateSelect rateSele
+     if (pierSide == PIER_SIDE_WEST) { if (guideAction == GA_FORWARD) guideAction = GA_REVERSE; else guideAction = GA_FORWARD; };
+     if (guideAction == GA_REVERSE) { VF("MSG: Guide, Axis2 rev @"); rateAxis2 = -rate; } else { VF("MSG: Guide, Axis2 fwd @"); rateAxis2 = rate; }
+     V(rate); VL("X");
+-    mount.update();
++    mount.pulseGuideChanged();
+   } else {
+     state = GU_GUIDE;
+     backlashEnableControl(true);
+@@ -157,7 +157,7 @@ void Guide::stopAxis2(GuideAction stopDirection, bool abort) {
+       VLF("MSG: Guide, Axis2 stopped");
+       guideActionAxis2 = GA_NONE;
+       rateAxis2 = 0.0F;
+-      mount.update();
++      mount.pulseGuideChanged();
+     }
+   }
+ }

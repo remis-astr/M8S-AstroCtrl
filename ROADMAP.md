@@ -422,7 +422,99 @@ page de contrôle, jamais à parler au M8S (ce lien passe en USB).
 
 ## Phase 6 — Tests bout en bout
 
-**Ordre conseillé pour la première nuit** (24/09) :
+### Première nuit (25/09) — bilan
+
+- Plate solve : OK et rapide (IMX462 en 1080p, pose de 1 s : capture 2,0 s
+  + solve 0,94 s, focale mesurée 176,5 mm).
+- Guidage : erreurs de ±30″. Aucun journal n'avait été conservé.
+  Analyse du 29/09 :
+  1. **La calibration enregistrée était fausse** : orthogonalité de 88,6°,
+     les vecteurs AD et Dec étaient presque parallèles. La dérive propre
+     du suivi s'ajoutait aux deux mesures.
+     → Désormais, la dérive est mesurée puis soustraite (6 trames sans
+     impulsion). Une calibration à plus de 20° d'orthogonalité est
+     refusée et l'ancienne est gardée. Les vitesses mesurées sont
+     comparées à celles attendues (`ra_speed_ratio`, `dec_speed_ratio`).
+  2. **OnStepX ALT-AZ n'applique les impulsions qu'à la seconde près**
+     (voir `firmware/README.md`). Un correctif firmware est compilé mais
+     pas flashé.
+  3. L'heure de la E4 était juste ce soir-là (vérifié sur la calibration :
+     elle correspond à la Lyre à 20h12 UTC). En revanche, le 29/09, la E4
+     avait 3,8 jours de retard après un redémarrage.
+
+### Préparé le 29/09 (déployé sur le M8S)
+
+- **Référence de temps = allsky**, qui prend l'heure du téléphone à chaque
+  ouverture de sa page. Le M8S se recale sur allsky au démarrage et toutes
+  les 15 min. La E4 n'est jamais écrite.
+  - `/mount/site` donne `mount_clock_error_s` et `mount_clock_ok` ; la
+    page de guidage affiche l'alerte.
+  - `GET /time/check` compare le M8S et la E4 à NTP quand le M8S a
+    Internet (CPL).
+- **Journal de session** :
+  `/var/lib/m8s-ctrl/journal/AAAA-MM-JJ.jsonl`, une nuit de midi à midi.
+  Il contient les solves, les points et résultats de calibration, chaque
+  trame de guidage (erreur, impulsions voulues et envoyées, hauteur et
+  azimut) et les changements de réglages.
+- **Réglages du guidage persistants** :
+  `/var/lib/m8s-ctrl/guide_settings.json`, écrit à chaque
+  `POST /guide/settings`.
+- **Guidage « à blanc »** (`POST /guide/start {"dry_run": true}`) : mesure
+  la dérive du suivi sans corriger. Des impulsions manuelles
+  (`/mount/guide`) envoyées pendant ce mode donnent la réponse réelle de
+  la monture.
+- **Lecture des réglages des axes** (`GET /mount/axes`). Relevé du 29/09 :
+  - pas/° : 20272 (Az) et 20810 (Alt). Attention, `Config.h` indique
+    **20730** pour l'Alt : la valeur en NV a été changée via SWS depuis ;
+  - µpas 64 (goto 32), courants 150/300/300 mA ;
+  - compensation de jeu 21″ (Az) et 31″ (Alt) ;
+  - impulsions à 0,5×.
+- **Mesure des pas/° par plate solve**
+  (`POST /mount/steps/start {"axis":1|2}`, puis `/mount/steps/status`) :
+  - principe : un seul axe tourne, un solve à chaque arrêt, puis on ajuste
+    le cercle décrit sur le ciel ;
+  - résultat : pas/° proposés ± incertitude, résidus, et pour l'azimut
+    l'inclinaison de la base ;
+  - validé sur données synthétiques (écart retrouvé à 1 pas/° près) ;
+  - n'écrit rien dans la E4.
+
+### Protocole de la prochaine session (avec Claude en direct via le CPL)
+
+Avant la nuit :
+1. Mettre la E4 à l'heure via SWS. L'alerte de la page doit disparaître
+   (`mount_clock_ok: true`).
+2. Décider si on flashe le firmware corrigé (`firmware/README.md`).
+
+Au crépuscule :
+3. Ouvrir la page d'allsky sur le téléphone : ça règle l'heure d'allsky,
+   donc celle du M8S.
+4. Déparquer, pointer au nord, faire « Résoudre + recaler ».
+
+Nuit noire, pas/degré (≈ 5 min par axe, à faire **avant** l'alignement) :
+
+5. Hauteur (axe 2) : azimut ≈ 0 (nord), hauteur ≈ 25°, puis
+   `{"axis": 2, "points": 5, "move_s": 8}` vers le haut.
+6. Azimut (axe 1) : hauteur ≈ 45°, azimut ≈ 340°, puis
+   `{"axis": 1, "points": 5, "move_s": 8}` vers l'est (w).
+   Le ciel tourne peu près du pôle, donc les horodatages y pèsent peu.
+7. Refaire chaque mesure une fois pour juger la répétabilité. Si l'écart
+   dépasse ~0,1 % et que les deux mesures concordent :
+   - saisir la nouvelle valeur dans SWS, puis redémarrer la E4 ;
+   - re-mesurer ;
+   - reporter la valeur dans `Config.h`.
+
+Suivi et guidage :
+
+8. Alignement 3 points.
+9. Cible vers le sud, hauteur ≈ 50° : calibration. Vérifier que les
+   rapports de vitesse sont ≈ 1 et l'orthogonalité < 5°.
+10. Guidage à blanc 5 min : donne la dérive du suivi seul.
+11. Guidage 15 min avec les réglages par défaut, puis ajuster l'agressivité
+    (0,5 à 0,9), `min_move_px` et la pose (1 à 2 s). Comparer les RMS dans
+    le journal.
+12. Si le firmware est flashé : refaire l'étape 11 et comparer.
+
+### Ordre conseillé pour la première nuit (24/09)
 1. Heure : mettre la E4 à l'heure via SWS, puis vérifier dans la page que
    l'alerte « heure incohérente » ne s'affiche pas.
 2. Caméra : pose de 500 à 1000 ms, gain élevé, mode large

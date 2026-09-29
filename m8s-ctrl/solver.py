@@ -70,6 +70,7 @@ class SolveResult:
     capture_s: float = 0.0
     solve_s: float = 0.0
     utc: str = ""
+    utc_ts: float = 0.0          # instant estimé du milieu de pose (horloge du M8S, s)
     raw_mode: str = ""
     sensor: str = ""
     exposure_ms: float = 0.0     # pose réelle de la trame (lue dans ses en-têtes)
@@ -115,6 +116,7 @@ def solve(hint: tuple[float, float] | None = None, radius_deg: float = 10.0) -> 
     frame = guidecam.fetch_frame()
     exposure_ms = frame.exposure_us / 1000
     utc = dt.datetime.now(dt.timezone.utc)
+    utc_ts = utc.timestamp() - exposure_ms / 2000
     img = frame.data
     capture_s = time.monotonic() - t0
 
@@ -142,7 +144,7 @@ def solve(hint: tuple[float, float] | None = None, radius_deg: float = 10.0) -> 
     solve_s = time.monotonic() - t1
 
     res = SolveResult(solved=False, capture_s=round(capture_s, 2), solve_s=round(solve_s, 2),
-                      utc=utc.isoformat(timespec="seconds"), raw_mode=frame.raw_mode,
+                      utc=utc.isoformat(timespec="seconds"), utc_ts=round(utc_ts, 3), raw_mode=frame.raw_mode,
                       sensor=frame.sensor, exposure_ms=exposure_ms, gain=frame.gain, fov_height_deg=round(fov_h, 3),
                       scale_arcsec_px=round(scale, 3))
     if proc is None:

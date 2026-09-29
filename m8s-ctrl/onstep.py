@@ -317,6 +317,53 @@ class OnStep:
             r = self.cmd(":Gt#")
         return parse_degrees(r)
 
+    def longitude_east_deg(self) -> float:
+        """Longitude comptée positive vers l'est (`:Gg#` : est négatif)."""
+        r = self.cmd(":GgH#")
+        if r in (None, "0"):
+            r = self.cmd(":Gg#")
+        return -parse_degrees(r)
+
+    # -- réglages des axes (lecture seule) ----------------------------------
+
+    def axis_angles(self) -> tuple[float, float]:
+        """Angles instrument des deux axes (°), sans modèle de pointage :
+        pas moteur / pas par degré, plus l'index (`:GX42#`, `:GX43#`)."""
+        return float(self.cmd(":GX42#")), float(self.cmd(":GX43#"))
+
+    def axis_parameter(self, axis: int, number: int) -> str:
+        """Paramètre NV d'un axe (`:GXA<axis>,<n>#`) : « valeur,min,max,type,$nom »."""
+        return self.cmd(f":GXA{axis},{number}#") or ""
+
+    def steps_per_degree(self, axis: int) -> dict:
+        """Pas par degré en service (`:GXE4#`/`:GXE5#`) et en NV (appliqué
+        au prochain redémarrage de la E4 s'il diffère)."""
+        active = int(float(self.cmd(f":GXE{3 + axis}#")))
+        nv = float(self.axis_parameter(axis, 1).split(",")[0])
+        return {"active": active, "nv": nv}
+
+    def backlash_arcsec(self) -> tuple[int, int]:
+        return int(self.cmd(":%BR#")), int(self.cmd(":%BD#"))
+
+    def pulse_guide_rate(self) -> float:
+        """Vitesse des impulsions de guidage, en × sidéral (`:GX90#`)."""
+        return float(self.cmd(":GX90#"))
+
+    def axis_setup(self) -> dict:
+        names = {1: "steps_per_degree", 2: "limit_min", 3: "limit_max", 4: "reverse",
+                 5: "microsteps", 6: "microsteps_goto", 7: "current_hold_ma",
+                 8: "current_run_ma", 9: "current_goto_ma", 10: "decay", 11: "decay_goto"}
+        out = {}
+        for axis in (1, 2):
+            d = {"driver": self.cmd(f":GXA{axis},M#"), "steps_per_degree_active": self.steps_per_degree(axis)["active"]}
+            for n, name in names.items():
+                d[name] = float(self.axis_parameter(axis, n).split(",")[0])
+            out[f"axis{axis}"] = d
+        br, bd = self.backlash_arcsec()
+        out["backlash_arcsec"] = {"axis1": br, "axis2": bd}
+        out["pulse_guide_rate_x"] = self.pulse_guide_rate()
+        return out
+
     def wait_goto_done(self, timeout_s: float = 240.0, abort=None) -> None:
         """Attend la fin du goto (lettre 'N' = pas de goto dans :GU#)."""
         deadline = time.monotonic() + timeout_s
