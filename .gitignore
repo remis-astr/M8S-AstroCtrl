@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .claude/
 firmware/build/
+tools/offsets.json
+tools/solveguide.jsonl

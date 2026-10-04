@@ -236,6 +236,14 @@ def mount_stop():
     return {"ok": True}
 
 
+@app.post("/mount/home")
+def mount_home():
+    if guider.busy or align_job.running or steps_job.running:
+        raise HTTPException(409, "guidage, alignement ou mesure des axes en cours")
+    mount_call(mount.go_home)
+    return {"ok": True}
+
+
 class GuideBody(BaseModel):
     direction: str               # n, s, e, w
     ms: int = Field(ge=1, le=16399)

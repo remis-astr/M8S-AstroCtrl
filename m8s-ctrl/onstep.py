@@ -24,6 +24,7 @@ import glob
 import logging
 import os
 import re
+import termios
 import threading
 import time
 
@@ -224,7 +225,11 @@ class OnStep:
         with self._lock:
             try:
                 return self._cmd(cmd, kind, timeout)
-            except serial.SerialException as e:
+            # Coupure USB (parasites des moteurs) : selon le moment, pyserial
+            # lève SerialException, OSError ou termios.error (tcflush sur un
+            # descripteur mort) ; dans tous les cas on rouvre au prochain appel
+            # (le CH340 revient parfois sous un autre ttyUSBn).
+            except (serial.SerialException, OSError, termios.error) as e:
                 self._drop()
                 raise OnStepError(f"liaison série perdue: {e}") from e
 
@@ -464,6 +469,11 @@ class OnStep:
 
     def stop(self) -> None:
         self.cmd(":Q#", NONE)
+
+    def go_home(self) -> None:
+        """GoTo vers la position home (`:hC#`, sans réponse) ; OnStepX
+        arrête le suivi à l'arrivée."""
+        self.cmd(":hC#", NONE)
 
     def pulse_guide(self, direction: str, ms: int) -> None:
         """Impulsion de guidage. En OnStepX, w/e agissent sur Axis1 et n/s

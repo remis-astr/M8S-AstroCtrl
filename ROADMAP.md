@@ -442,6 +442,85 @@ page de contrôle, jamais à parler au M8S (ce lien passe en USB).
      elle correspond à la Lyre à 20h12 UTC). En revanche, le 29/09, la E4
      avait 3,8 jours de retard après un redémarrage.
 
+### Nuit du 04/10 — mesures de la monture et guidage sur Saturne
+
+Contraintes du site : maison au nord (NE → NO), arbres à l'ouest et
+garage au sud-ouest. L'utilisateur veut **≥ 60° de hauteur** sauf pour
+une cible demandée. Un GoTo depuis la position home descend en tournant
+l'azimut et passe par le nord-ouest : pour descendre, monter d'abord vers
+87°, tourner l'azimut tube presque vertical, puis descendre côté sud. Le
+retour home (`:hC#`, nouveau `POST /mount/home`) monte d'abord puis tourne
+à 90° : sûr.
+
+**Pas par degré** (`/mount/steps`, à ≥ 60° de hauteur au sud) :
+- Hauteur : 20 312 ± 20 et 20 341 ± 25 (une valeur aberrante retirée) →
+  **20 325 saisi en NV et actif** (avant : 20 810 ; `Config.h` : 20 730,
+  à mettre à jour lors du prochain flash).
+- Azimut : **le rapport dépend de l'azimut** (+3 % vers 178-198°, +0,3 à
+  +1 % vers 200-230°, ondulation de ±2′) → excentricité ou défaut de rondeur
+  de l'entraînement. Laissé à 20 272. Une valeur moyenne demanderait un
+  tour complet à ≥ 70°.
+- **Base inclinée d'environ 1,5° vers le sud** (88′ à 101′ vers 183-184°,
+  sur 3 mesures). Le modèle de pointage l'absorbe ; la mettre de niveau
+  améliorerait le suivi. Près du zénith, cette inclinaison fausse fortement
+  l'azimut apparent (11° à 87° de hauteur) : ne pas contrôler l'azimut
+  au zénith.
+
+**Jeu** (petits déplacements de 15′ et plate solve,
+`tools/backlash.py`) :
+- **Hauteur : zone morte d'environ 12′ (700-770″) à chaque inversion**,
+  reproduite 4 fois, position stable après l'arrêt (pas une trame en
+  retard). Cause probable : courroie GT2 de 6 mm longue, pas assez tendue,
+  ou poulie qui glisse sur l'arbre. Compensation laissée à 31″ (12′
+  compensés d'un coup feraient plus de mal que de bien en guidage).
+- Azimut : 72 à 170″ perdus par inversion → **100″ saisis** (avant : 21″).
+
+**Pointage** : alignement 3 points à 70° (135°, 157,5°, 180°) → erreur
+de 63′ (points trop proches et à la même hauteur, plus le jeu). Centrage
+par `/center` : convergence lente (2,6° → 104″ en 5 itérations), chaque
+GoTo retombant dans la zone morte de hauteur.
+
+**Suivi seul sur Saturne** (hauteur 32°) : 2,4″/s pendant 130 s (rattrapage
+du jeu en hauteur après le centrage), puis ≈ 1″/s ; moyenne 1,1″/s sur
+5 min.
+
+**Calibration du guideur : impossible** avec cette mécanique (3 essais) :
+jeu Dec au maximum (15 s), puis impulsions w/e sans effet (elles demandent
+à la hauteur de ralentir, donc entrent dans la zone morte) et appariement
+faux avec 2 à 8 étoiles près de Saturne (saut de 160 px).
+`calib_step_ms` est resté à 2000 dans `guide_settings.json`.
+
+**Guidage par plate solve** (`tools/solveguide.py`, contournement sans
+calibration) : un solve toutes les 5 s, impulsions directes sur les axes
+(n/s = hauteur, w/e = azimut, 7,5″/s), raquette à 8× au-delà de 60″.
+Saturne tenue **≈ 12″ RMS** (hauteur 10-11″, azimut 6″) pendant 33 min.
+Les impulsions « s » (contre le suivi qui monte) ont un effet double à
+cause de la zone morte → gain divisé par 2 vers le bas. Décalages réglables
+à chaud (`offsets.json`).
+**Pivot de la caméra principale** (Newton + IMX585) : la caméra guide doit
+viser **−10,5′ en hauteur et +1,17′ en azimut (sur le ciel)** par rapport à
+la cible (réglé à l'œil sur Saturne ; constant en ALT-AZ). Sauvé dans
+`sessions/2026-10-04/` et `/var/lib/m8s-ctrl/pivot_main_camera.json`.
+
+**Incidents** :
+- Parasites des moteurs : **3 coupures USB** du CH340 (`disabled by hub
+  (EMI?)`), une déconnexion d'allsky. Correctif `onstep.py` : reconnexion
+  aussi sur `termios.error`/`OSError` (le CH340 revient parfois en
+  ttyUSB1). La réouverture du port n'a pas redémarré la E4. À faire :
+  ferrites, câbles USB blindés et courts, câbles moteurs séparés.
+- Le recalage horaire au démarrage du M8S échoue si allsky n'est pas prêt
+  (2 fois) → à corriger (nouvelles tentatives pendant les premières
+  minutes). Après un redémarrage d'allsky, rouvrir sa page sur le
+  téléphone (sinon son horloge est fausse).
+- E4 : heure à remettre via SWS après chaque redémarrage (saisie manuelle
+  de l'heure d'été : « heure du navigateur » a donné 1 h d'écart). Une
+  fois, son horloge a pris 79 min de retard sans redémarrage (pendant une
+  manipulation du SWS).
+
+**Firmware corrigé : toujours pas flashé.** Décision : d'abord retendre la
+courroie de hauteur, refaire le test de jeu, puis comparer les deux
+firmwares sur la même cible.
+
 ### Préparé le 29/09 (déployé sur le M8S)
 
 - **Référence de temps = allsky**, qui prend l'heure du téléphone à chaque

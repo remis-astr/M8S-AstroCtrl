@@ -1,0 +1,12 @@
+{
+ "date": "2026-10-04",
+ "frame": "alt-az (constant pour une monture ALT-AZ : pas de rotation entre tube et axes)",
+ "guide_center_minus_target_alt_arcmin": -10.5,
+ "guide_center_minus_target_az_sky_arcmin": 1.17,
+ "meaning": "pour centrer une cible dans la caméra principale (Newton 200/1200 + IMX585), la caméra guide (177 mm, IMX462) doit viser 10,5′ plus bas et 1,17′ (sur le ciel) plus loin en azimut ; réglé à l'œil sur Saturne",
+ "measured_at": {
+  "target": "Saturne",
+  "alt_deg": 35,
+  "az_deg": 134
+ }
+}
