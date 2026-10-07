@@ -47,6 +47,23 @@ compilé le 29/09 à partir de :
 Carte `esp32:esp32:esp32:PartitionScheme=huge_app,FlashFreq=80,CPUFreq=240`,
 cœur 3.3.11 : 1 331 860 octets (42 %).
 
-**Pas encore flashé** : c'est à toi de décider. Les réglages en NV
+**Flashé le 07/10/2026** depuis le M8S (esptool 4.8.1 dans `/opt/esptool`,
+lancé par `PYTHONPATH=/opt/esptool python3 -m esptool`, `m8s-ctrl` arrêté
+pendant l'opération, 115 200 bauds car 460 800 corrompt les données).
+Application seule écrite à 0x10000 et vérifiée ; NV inchangée (pas/°,
+compensation du jeu, WiFi). Sauvegarde complète de la flash d'avant :
+`/root/e4-backup/e4-full-20261007.bin` sur le M8S. Retour arrière :
+`write_flash 0x10000` de la zone 0x10000-0x310000 de cette sauvegarde.
+
+Avant le flash, c'était à toi de décider. Les réglages en NV
 (pas/degré, heure, site, modèle d'alignement) ne sont normalement pas
 effacés par un flash de l'application seule (`.bin`, pas le `.merged.bin`).
+
+## Prochaine compilation (décidé le 07/10/2026)
+
+Pour toute prochaine modification du firmware, partir de la version amont
+la plus récente d'OnStepX (au 07/10 : 4 commits après `d487428`), qui
+contient `21c3834` (vitesses de suivi ALTAZM calculées en `double`), puis
+réappliquer `onstepx-altaz-pulse-guide.patch`, ton `Config.h` et ton
+`Plugins.config.h`. Ce correctif amont a un effet négligeable sur notre
+guidage actuel (≈ 0,01″/min) : il ne justifie pas un flash à lui seul.
